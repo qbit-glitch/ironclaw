@@ -687,7 +687,10 @@ Respond in JSON format:
             // in reasoning_content wrapped in <think> tags and content is
             // null — the .or(reasoning_content) fallback picks it up, then
             // clean_response strips the think tags leaving an empty string.
-            let cleaned = clean_response(&content);
+            // Pre-truncate at tool tags to preserve text before unrecoverable
+            // tool XML (issue #789).
+            let pre_truncated = truncate_at_tool_tags(&content);
+            let cleaned = clean_response(&pre_truncated);
             let final_text = if cleaned.trim().is_empty() {
                 tracing::warn!(
                     "LLM response was empty after cleaning (original len={}), using fallback",
@@ -702,14 +705,21 @@ Respond in JSON format:
                 usage,
             })
         } else {
-            // No tools, use simple completion
+            // No tools (force_text mode), use simple completion
             let mut request = CompletionRequest::new(messages)
                 .with_max_tokens(4096)
                 .with_temperature(0.7);
             request.metadata = context.metadata.clone();
 
             let response = self.llm.complete(request).await?;
-            let cleaned = clean_response(&response.content);
+            // Pre-truncate at tool tags before cleaning. Local models (Qwen3,
+            // Nanbeige, etc.) often emit text followed by <tool_call> XML even
+            // when no tools are available. Truncating preserves the valid text
+            // portion; without this, clean_response may strip unclosed tool tags
+            // and discard everything from the tag onward, leaving an empty string
+            // that triggers the fallback. (See issue #789)
+            let pre_truncated = truncate_at_tool_tags(&response.content);
+            let cleaned = clean_response(&pre_truncated);
             let final_text = if cleaned.trim().is_empty() {
                 tracing::warn!(
                     "LLM response was empty after cleaning (original len={}), using fallback",
@@ -1441,6 +1451,36 @@ fn strip_bracket_tool_calls(text: &str) -> String {
 
 /// Tool-related tags stripped with simple string matching (no code-awareness needed).
 const TOOL_TAGS: &[&str] = &["tool_call", "function_call", "tool_calls"];
+
+/// Truncate text at the first tool-call tag, preserving content before it.
+///
+/// Some local models (Qwen3, Nanbeige, etc.) emit mixed text + tool XML even
+/// in forced-text mode (no tools available). Instead of stripping the tool tags
+/// (which can discard unclosed tags and leave an empty string), truncate at the
+/// first occurrence. This preserves the valid text portion.
+///
+/// Handles: `<tool_call>`, `<function_call>`, `<tool_calls>`,
+/// and pipe-delimited variants `<|tool_call|>`, `<|function_call|>`, `<|tool_calls|>`.
+fn truncate_at_tool_tags(text: &str) -> String {
+    let patterns: &[&str] = &[
+        "<tool_call>",
+        "<tool_call ",
+        "<function_call>",
+        "<function_call ",
+        "<tool_calls>",
+        "<tool_calls ",
+        "<|tool_call|>",
+        "<|function_call|>",
+        "<|tool_calls|>",
+    ];
+
+    let first_pos = patterns.iter().filter_map(|p| text.find(p)).min();
+
+    match first_pos {
+        Some(pos) => text[..pos].to_string(),
+        None => text.to_string(),
+    }
+}
 
 /// Strip thinking/reasoning tags using regex, respecting code regions.
 ///
@@ -2413,5 +2453,109 @@ That's my plan."#;
         // But without an exclusion phrase, multiple prefixes should be checked.
         let text = "I said let me be clear, then let me fetch the data.";
         assert!(llm_signals_tool_intent(text));
+    }
+
+    // ---- Issue #789: truncate_at_tool_tags ----
+
+    #[test]
+    fn test_truncate_at_tool_tags_preserves_text_before_tool_call() {
+        let input = "Hello! Let me get up to speed. <tool_call><function=memory_read>{\"name\": \"MEMORY.md\"}</function></tool_call>";
+        assert_eq!(
+            truncate_at_tool_tags(input),
+            "Hello! Let me get up to speed. "
+        );
+    }
+
+    #[test]
+    fn test_truncate_at_tool_tags_unclosed_tool_call() {
+        let input = "The capital of France is Paris. <tool_call><function=memory_write>";
+        assert_eq!(
+            truncate_at_tool_tags(input),
+            "The capital of France is Paris. "
+        );
+    }
+
+    #[test]
+    fn test_truncate_at_tool_tags_no_tool_tags() {
+        let input = "Just a normal response with no tool tags.";
+        assert_eq!(truncate_at_tool_tags(input), input);
+    }
+
+    #[test]
+    fn test_truncate_at_tool_tags_only_tool_call() {
+        let input = "<tool_call>{\"name\": \"search\"}</tool_call>";
+        assert_eq!(truncate_at_tool_tags(input), "");
+    }
+
+    #[test]
+    fn test_truncate_at_tool_tags_function_call_variant() {
+        let input = "Answer text.<function_call>{\"name\": \"foo\"}</function_call>";
+        assert_eq!(truncate_at_tool_tags(input), "Answer text.");
+    }
+
+    #[test]
+    fn test_truncate_at_tool_tags_pipe_delimited() {
+        let input = "Hello!<|tool_call|>{\"name\": \"search\"}<|/tool_call|>";
+        assert_eq!(truncate_at_tool_tags(input), "Hello!");
+    }
+
+    #[test]
+    fn test_truncate_at_tool_tags_with_attributes() {
+        let input = "Text before <tool_call type=\"function\">search()</tool_call>";
+        assert_eq!(truncate_at_tool_tags(input), "Text before ");
+    }
+
+    // ---- Issue #789: full pipeline with think + tool_call in force_text mode ----
+
+    #[test]
+    fn test_issue_789_think_then_tool_call_no_final() {
+        // Qwen3 pattern: <think>reasoning</think> followed by tool XML, no <final> tags.
+        // After think stripping, only tool XML remains → clean_response strips it → empty.
+        // With pre-truncation, the tool XML is removed first, leaving think content
+        // which gets stripped, but crucially the truncation happens before cleaning.
+        let raw = "<think>searching for context</think><tool_call><function=memory_read>{}</function></tool_call>";
+        let truncated = truncate_at_tool_tags(raw);
+        let cleaned = clean_response(&truncated);
+        // The think content is stripped, leaving empty — but at least we didn't
+        // lose text that was before the think tags.
+        assert_eq!(cleaned, "");
+
+        // More realistic: model produces text + think + tool_call
+        let raw = "The capital of France is Paris.\n\n<think>Let me also check memory</think><tool_call><function=memory_write>{}</function></tool_call>";
+        let truncated = truncate_at_tool_tags(raw);
+        let cleaned = clean_response(&truncated);
+        assert_eq!(cleaned, "The capital of France is Paris.");
+    }
+
+    #[test]
+    fn test_issue_789_text_before_tool_call_preserved() {
+        // The primary bug: model emits valid text then tool XML in force_text mode.
+        // Without pre-truncation, unclosed tool tag discards everything after it.
+        let raw = "Hello! Let me get up to speed. <tool_call><function=memory_read>{\"name\": \"MEMORY.md\"}";
+        let truncated = truncate_at_tool_tags(raw);
+        let cleaned = clean_response(&truncated);
+        assert_eq!(cleaned, "Hello! Let me get up to speed.");
+    }
+
+    #[test]
+    fn test_issue_789_thinking_only_response() {
+        // Secondary issue: Qwen3 returns thinking-only with no visible content.
+        // This still results in empty after cleaning — the fix here is the
+        // <think>/<final> prompt injection, not truncation.
+        let raw = "<think>The user asked about France. The capital is Paris.</think>";
+        let cleaned = clean_response(raw);
+        assert_eq!(cleaned, "");
+        // ^ This is expected — thinking-only responses with no visible text
+        // should still be empty. The fix for this is addressed separately
+        // by not injecting <think>/<final> format for models with native thinking.
+    }
+
+    #[test]
+    fn test_issue_789_multiple_tool_calls_after_text() {
+        let raw =
+            "Here are the results.\n<tool_call>search</tool_call>\n<tool_call>fetch</tool_call>";
+        let truncated = truncate_at_tool_tags(raw);
+        let cleaned = clean_response(&truncated);
+        assert_eq!(cleaned, "Here are the results.");
     }
 }
